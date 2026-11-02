@@ -1,80 +1,99 @@
-# Mottainai — Redis Mobile API
+# API Redis de notificações
 
-Essa API é a API feita em REDIS para as notificações do aplicativo Mottainai. 
 
-Construída com Java 17 e Spring Boot 3.4.2, ela atua exclusivamente como uma fachada de leitura (read-only facade). O seu principal objetivo é permitir que o aplicativo mobile consuma e gerencie o estado das notificações (como alertas de queima de estoque ou mensagens operacionais) de forma totalmente segura, garantindo que o dispositivo móvel nunca tenha acesso direto ao banco de dados Redis.  
+A API Java/Spring lê notificações de um usuário e permite marcá-las como lidas. Produtores autorizados publicam no Stream Redis ou usam a rota HTTP interna protegida por segredo; o aplicativo consome as notificações pelas rotas de leitura. O contrato do Stream, as chaves e a retenção estão no [guia do banco Redis](https://github.com/Mottainai-One/Mottainai-Hub/blob/main/Docs/banco/redis/01-estruturas-e-notificacoes.md).
 
-## 🔒 Segurança e Infraestrutura
+## Autenticação e configuração
 
-A arquitetura foi desenhada para evitar qualquer tipo de manipulação ou forja de alertas por parte do cliente:
+As rotas de notificações exigem `Authorization: Bearer <token>`. A API valida a assinatura JWT e a expiração; o código exige `exp`, `sub`, `empresa_id` e `role`. `empresa_id` e o identificador do usuário devem representar inteiros positivos. O usuário vem de `usuario_id`, quando presente, ou de `sub`; tokens com `usuario_id` exigem `use=access`. Os perfis aceitos são `CLIENTE`, `ESTOQUISTA`, `GERENTE` e `DONO`. A empresa e o usuário são extraídos do token, não de parâmetros do cliente. Token ausente, inválido, expirado ou com claims inválidos resulta em `401`.
 
-* **Autenticação Restrita:** Utiliza tokens JWT Bearer HS256 (com secret de no mínimo 32 caracteres).
-* **Claims Obrigatórios:** O token deve conter obrigatoriamente `exp`, `sub`, `empresa_id` e `role`.
-* **Controle de Perfis:** A API aceita requisições apenas dos perfis `CLIENTE`, `ESTOQUISTA`, `GERENTE` e `DONO`.
-* **Isolamento Multi-tenant:** Os dados de identificação (empresa e usuário) são extraídos exclusivamente do token JWT. O cliente não pode forjar acessos passando parâmetros no corpo da requisição.
-* **Topologia de Rede:** O banco Redis vive protegido dentro da rede interna do Docker (`mottainai-redis-network`). A API de leitura continua exposta apenas localmente; o endpoint de publicação aceita somente chamadas servidor-servidor com segredo próprio.
+A configuração usa `REDIS_URL`, `JWT_SECRET` e `JWT_ALGORITHM`, cujo padrão é `HS256`; apenas esse algoritmo é aceito e `JWT_SECRET` deve estar em Base64 e conter pelo menos 32 bytes após a decodificação. O processo escuta na porta `8080`; a exposição de rede depende do ambiente. Os endpoints de saúde não exigem o cabeçalho JWT neste controller. Nunca inclua tokens reais ou senhas em exemplos, logs ou chamados.
 
-## 🗂️ Escopo e Endpoints
+## Saúde
 
-**Nota Arquitetural:** O app mobile não pode criar notificações. Produtores confiáveis usam o Redis Stream dentro da rede Docker ou o endpoint servidor-servidor protegido por segredo.
-
-Os endpoints expostos são focados estritamente na leitura e controle de estado:
-
-| Endpoint | Ação / Propósito |
-|---|---|
-| `GET /livez` | Healthcheck básico. Confirma que o processo Java está vivo (não acessa o Redis). |
-| `GET /readyz` | Healthcheck de infraestrutura. Confirma que o banco Redis está acessível e respondendo. |
-| `GET /v1/notifications?limit=20` | Lista as notificações pertencentes ao usuário autenticado e retorna o total de mensagens não lidas. |
-| `POST /v1/notifications/{id}/read` | Marca uma notificação como lida. É uma operação idempotente (pode ser chamada múltiplas vezes sem duplicar ou corromper o estado). |
-| `POST /internal/v1/notifications` | Publica uma notificação no Stream para consumo interno. Exige `X-Mottainai-Notification-Secret`; não usar pelo app mobile. |
-
-O endpoint interno aceita `companyId`, `userId`, `id`, `title`, `body` e `priority`. Ele valida os limites do mesmo contrato do Stream e retorna `202`/`queued`. Configure `NOTIFICATION_PUBLISHER_SECRET` com pelo menos 32 caracteres aleatórios. Para uso por serviços fora da rede Docker, publique **somente esse endpoint** por um proxy HTTPS com controle de acesso; a porta padrão do Docker permanece vinculada a `127.0.0.1`. Não exponha a porta do Redis.
-
-Para os pedidos de aprovação do PDV, a Cloud Function publica uma notificação por gerente elegível nesta rota e também envia o push pelo FCM. O `id` é estável por pedido e gerente, então uma repetição da chamada não duplica a notificação Redis.
-
-## 🤖 Ingestão via Redis Stream (serviço de IA)
-
-A criação de notificações continua **fora do HTTP**. O serviço de IA publica em um Redis Stream e a API consome com um *consumer group*, gravando no formato que o app lê. Como o Stream só é alcançável dentro da rede Docker e exige a senha do Redis, o app mobile continua sem conseguir forjar alertas.
-
-**Stream:** `mottainai:v1:notification:stream` · **Consumer group:** `notification-writers`
-
-| Campo | Obrigatório | Regra |
+| Método e rota | Sucesso | Significado |
 |---|---|---|
-| `company_id` | sim | inteiro positivo |
-| `user_id` | sim | inteiro positivo |
-| `title` | sim | até 120 caracteres |
-| `body` | sim | até 1000 caracteres |
-| `priority` | sim | `1`, `2` ou `3` |
-| `id` | não | sem `:`, até 128 caracteres; se ausente, usa `stream-<ID do registro>` |
+| `GET /livez` | `200`, `{"status":"alive"}` | Processo vivo; não consulta o Redis. |
+| `GET /readyz` | `200`, `{"status":"ready"}` | Redis respondeu ao ping. Falha de conexão retorna `503`. |
 
-Exemplo de publicação:
+`/readyz` verifica conectividade, não comprova que uma notificação foi produzida, processada e entregue ao aplicativo.
 
-```bash
-XADD mottainai:v1:notification:stream * \
-  company_id 1 user_id 301 priority 3 \
-  title "Sugestao da IA: promocao no setor 3" \
-  body "Modelo identificou 12 itens com risco de perda em 48h."
+## Listar notificações
+
+```http
+GET /v1/notifications?limit=20
+Authorization: Bearer <token>
 ```
 
-A escrita é atômica (hash, inbox e contador de não lidas em um único script Lua) e idempotente por `id`. Mensagens malformadas são encaminhadas ao Stream de falhas antes da confirmação (`XACK`).
+`limit` é opcional, padrão `20`, e deve estar entre 1 e 100; fora desse intervalo retorna `400`. A resposta contém o contador total de não lidas e até `limit` notificações disponíveis, ordenadas por prioridade e, em caso de empate, pela data de criação:
 
-Reenviar um ID ainda existente preserva conteúdo, status de leitura, data e TTL. Sem `id`, o identificador derivado do registro do Stream evita duplicar a notificação ao recuperar a mesma entrega; duas publicações distintas continuam sendo duas notificações. A deduplicação dura enquanto o hash existir (normalmente sete dias).
+```json
+{
+  "unreadCount": 1,
+  "notifications": [
+    {
+      "id": "alerta-123",
+      "title": "Produto próximo da validade",
+      "body": "Confira os itens do setor.",
+      "priority": 3,
+      "status": "unread",
+      "createdAt": 1793400000
+    }
+  ]
+}
+```
 
-O consumidor consulta lotes de até 100 mensagens a cada segundo e recupera entregas pendentes com `XPENDING` e `XCLAIM`. O tempo mínimo sem atividade é configurável por `NOTIFICATION_STREAM_RECLAIM_IDLE_MS` (padrão: 60000 ms). Falhas de escrita ou de confirmação mantêm a mensagem pendente para nova tentativa; após `NOTIFICATION_STREAM_MAX_DELIVERIES` entregas (padrão: 5), uma nova falha encaminha a mensagem para análise. O grupo e o Stream são criados na inicialização, inclusive em um Redis vazio; erros diferentes de `BUSYGROUP` interrompem a inicialização.
+`priority` é 1, 2 ou 3; `status` é `unread` ou `read`; `createdAt` é um timestamp Unix em segundos. Para notificações de promoção, a resposta também pode incluir `promotionId`, `storeId`, `productId` e `expiresAt`; consulte o contrato de promoções para as unidades e regras. O contador é reconciliado com os hashes ainda disponíveis e pode ser maior que a quantidade retornada quando o limite restringe a página. A lista não usa paginação por cursor ou offset.
 
-### Stream de falhas e retenção
+## Marcar como lida
+
+Rota: `POST /v1/notifications/{id}/read`.
+
+```http
+POST /v1/notifications/alerta-123/read
+Authorization: Bearer <token>
+```
+
+Não há corpo de requisição. Em caso de sucesso, inclusive se já estiver lida, retorna `200`:
+
+```json
+{"id": "alerta-123", "status": "read"}
+```
+
+O identificador não pode estar vazio, conter `:` ou exceder 128 caracteres; entradas inválidas retornam `422`. Uma notificação inexistente ou fora da caixa do usuário retorna `404`. A marcação é idempotente e a leitura não renova o TTL da notificação.
+
+## Publicação interna
+
+`POST /internal/v1/notifications` é destinado a produtores autorizados, não ao aplicativo móvel. Envie `X-Mottainai-Notification-Secret` com o segredo configurado em `NOTIFICATION_PUBLISHER_SECRET` (pelo menos 32 caracteres). O corpo recebe `companyId`, `userId`, `id`, `title`, `body` e `priority`; os campos opcionais de promoção `promotionId`, `storeId`, `productId` e `expiresAt` seguem o [contrato de promoções](docs/promotion-notifications.md). Uma publicação aceita retorna `202` com `id` e `status: queued`. O segredo inválido retorna `401`, o corpo inválido `400` e uma configuração ou fila indisponível `503`.
+
+Quando necessário fora da rede interna, exponha somente a rota interna por proxy HTTPS com controle de acesso. Não exponha a porta Redis.
+
+## Falhas, fluxo e testes
+
+Além de `400`, `401`, `404` e `422` descritos acima, a indisponibilidade detectada pelo endpoint de prontidão retorna `503`. O formato do corpo de erro depende do tratamento padrão do Spring e da configuração do ambiente; não há um contrato de erro customizado demonstrado no controller.
+
+O consumidor confirma mensagens válidas após gravá-las. Mensagens malformadas são encaminhadas ao Stream de falhas antes da confirmação; falhas de gravação ou confirmação permanecem pendentes para nova tentativa, respeitando o limite de entregas configurado. O endpoint de listagem não cria notificações e não aceita uma empresa ou usuário arbitrário no corpo.
+
+Para desenvolvimento, `mvn verify` executa os testes configurados; os testes de integração usam um Redis dedicado indicado por `REDIS_TEST_HOST` e, opcionalmente, `REDIS_TEST_PORT`. Não use uma instância de produção para testes. Consulte o [guia de segurança e operação](https://github.com/Mottainai-One/Mottainai-Hub/blob/main/Docs/banco/redis/02-api-seguranca-e-operacao.md) para retenção, persistência e limites do ambiente.
+
+## Executar
+
+Requisitos: Java 17, Maven e Redis acessível. Configure `REDIS_URL` e `JWT_SECRET` no ambiente e execute:
+
+```bash
+mvn verify
+mvn spring-boot:run
+```
+
+Use `REDIS_TEST_HOST` para habilitar os testes de integração contra um Redis dedicado.
+
+## Stream de falhas e retenção
 
 `mottainai:v1:notification:dead-letter` guarda `source_stream`, `source_id`, `consumer_group`, `reason`, `attempts`, `failed_at` (milissegundos UTC) e `payload` (JSON original). A transferência e o `XACK` ocorrem no mesmo script Lua, verificando primeiro se a entrega continua pendente. Se a gravação falhar, a mensagem original permanece pendente. Repetir a transferência de uma entrega já confirmada não duplica a falha. A chave é criada vazia na inicialização; não é preciso inserir dados fictícios.
 
 A manutenção roda a cada minuto. O histórico principal tem retenção de sete dias (`NOTIFICATION_STREAM_RETENTION_SECONDS=604800`); a fila de falhas, 30 dias (`NOTIFICATION_DEAD_LETTER_RETENTION_SECONDS=2592000`). O corte usa `XTRIM MINID`, limitado pelo último ID entregue e pelo menor ID pendente de **cada grupo existente**. Mensagens pendentes e ainda não entregues são preservadas, mesmo se ultrapassarem o prazo. Por segurança, o último registro entregue de cada grupo também pode permanecer. Na fila de falhas sem grupos, registros antigos são removidos pelo prazo; crie um grupo de revisão se precisar proteger falhas ainda não analisadas. Grupos abandonados seguram a limpeza e devem ser acompanhados. Um grupo criado depois da limpeza não recupera histórico já removido.
 
 Esses limites não são um teto rígido de memória: acompanhe tamanho, atraso e pendências. A API não remove grupos nem confirma mensagens de outros consumidores.
-
-A listagem, a criação e a marcação como lida reconciliam o índice e o contador com os hashes existentes em Lua. Referências expiradas não ocupam o limite de resultados nem contam como não lidas. O TTL dos hashes não é renovado pela leitura. A reconciliação percorre a caixa inteira do usuário, portanto seu custo cresce com o número de notificações ainda indexadas.
-
-## Testes
-
-Execute `mvn verify` para os testes unitários. Para executar também os testes de integração, disponibilize um Redis exclusivo para testes e configure `REDIS_TEST_HOST` e, se necessário, `REDIS_TEST_PORT` (padrão: 6379). Os testes usam chaves próprias e não exigem o `.env` da aplicação. O GitHub Actions executa as duas suítes com Redis 7.2.5.
 
 ## ⚙️ Configuração do Redis
 
