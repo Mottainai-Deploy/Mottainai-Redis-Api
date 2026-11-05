@@ -1,0 +1,29 @@
+services:
+  - type: keyvalue
+    name: mottainai-client-notifications-kv
+    plan: free
+    region: oregon
+    ipAllowList: []
+    maxmemoryPolicy: noeviction
+
+  - type: web
+    name: mottainai-client-notifications-api
+    runtime: docker
+    plan: free
+    region: oregon
+    autoDeployTrigger: "off"
+    healthCheckPath: /readyz
+    envVars:
+      - key: SERVER_PORT
+        value: "10000"
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: mottainai-client-notifications-kv
+          property: connectionString
+      - key: JWT_ALGORITHM
+        value: HS256
+      - key: JWT_SECRET
+        sync: false
+      - key: NOTIFICATION_PUBLISHER_SECRET
+        sync: false
