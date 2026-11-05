@@ -4,3 +4,8 @@ target/
 *.class
 .idea/
 *.iml
+
+# Arquivos locais de ambiente podem conter credenciais.
+/.env.*
+!/.env.example
+!/.env.redis.example
